@@ -1,27 +1,190 @@
 """
-Quiz engine router — STUB.
-TODO: implement session flow (next question for a topic, given the student's
-review-queue and mastery state), submit-answer scoring, and review-queue
-insertion on incorrect answers.
+Quiz engine — real implementation.
+
+next-question: for a given topic, serve (1) a due review-queue item — a
+question the student previously missed and hasn't yet answered correctly
+twice — before (2) a fresh question in the topic they haven't attempted, and
+only once both are exhausted, (3) the question they practiced longest ago in
+that topic, so the quiz never dead-ends even after full topic mastery.
+
+submit: scores the answer, records the attempt (attempt_number derived from
+prior attempts for this student+question), and updates the review queue —
+resetting/inserting on a miss, incrementing (and resolving at 2 in a row) on
+a correct retry.
 """
-from fastapi import APIRouter
-from app.models.schemas import AttemptSubmit, AttemptResult, QuestionOut
+from datetime import datetime, timedelta, timezone
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.orm import AnswerKey, Attempt, Question, ReviewQueue
+from app.db.session import get_db
+from app.models.schemas import AttemptResult, AttemptSubmit, QuestionOut
+from app.routers.auth import get_current_student
 
 router = APIRouter()
 
+# A missed question won't be re-served until this much time has passed, so a
+# student can't rack up "2 correct in a row" by just answering it twice back-to-back.
+REVIEW_COOLDOWN = timedelta(minutes=30)
+
 
 @router.get("/next-question", response_model=QuestionOut)
-def next_question(student_id: str, topic_id: str):
-    # TODO: prioritize due review-queue items before new questions.
-    ...
+async def next_question(
+    topic_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    student: dict = Depends(get_current_student),
+):
+    student_id = student["student_id"]
+    due_cutoff = datetime.now(timezone.utc) - REVIEW_COOLDOWN
+
+    due_review_stmt = (
+        select(Question)
+        .join(ReviewQueue, ReviewQueue.question_id == Question.id)
+        .where(
+            ReviewQueue.student_id == student_id,
+            ReviewQueue.resolved.is_(False),
+            Question.topic_id == topic_id,
+            or_(ReviewQueue.last_seen_at.is_(None), ReviewQueue.last_seen_at < due_cutoff),
+        )
+        .order_by(ReviewQueue.last_seen_at.asc().nulls_first())
+        .limit(1)
+    )
+    question = (await db.execute(due_review_stmt)).scalars().first()
+
+    if question is None:
+        attempted_ids = select(Attempt.question_id).where(Attempt.student_id == student_id)
+        fresh_stmt = (
+            select(Question)
+            .where(Question.topic_id == topic_id, Question.id.notin_(attempted_ids))
+            .order_by(func.random())
+            .limit(1)
+        )
+        question = (await db.execute(fresh_stmt)).scalars().first()
+
+    if question is None:
+        stalest_stmt = (
+            select(Question)
+            .join(Attempt, Attempt.question_id == Question.id)
+            .where(Question.topic_id == topic_id, Attempt.student_id == student_id)
+            .group_by(Question.id)
+            .order_by(func.max(Attempt.answered_at).asc())
+            .limit(1)
+        )
+        question = (await db.execute(stalest_stmt)).scalars().first()
+
+    if question is None:
+        raise HTTPException(status_code=404, detail="No questions available for this topic.")
+
+    options = (
+        (await db.execute(select(AnswerKey).where(AnswerKey.question_id == question.id)))
+        .scalars()
+        .all()
+    )
+
+    return QuestionOut(
+        id=question.id,
+        topic_id=question.topic_id,
+        prompt_text=question.prompt_text,
+        prompt_latex=question.prompt_latex,
+        image_path=question.image_path,
+        difficulty=question.difficulty,
+        question_type=question.question_type,
+        options=[{"option_label": o.option_label, "option_text": o.option_text} for o in options],
+    )
+
+
+def _matches(question_type: str, submitted: str, correct: AnswerKey) -> bool:
+    target = correct.option_label if question_type == "multiple_choice" and correct.option_label else correct.option_text
+    return submitted.strip().casefold() == target.strip().casefold()
 
 
 @router.post("/submit", response_model=AttemptResult)
-def submit_answer(payload: AttemptSubmit):
-    # TODO:
-    #  1. look up correct answer_keys row for the question
-    #  2. insert into attempts (attempt_number based on prior attempts for this student+question)
-    #  3. if incorrect -> upsert into review_queue (reset consecutive_correct to 0)
-    #  4. if correct AND was in review_queue -> increment consecutive_correct;
-    #     mark resolved=true once consecutive_correct hits 2 (across different sessions)
-    ...
+async def submit_answer(
+    payload: AttemptSubmit,
+    db: AsyncSession = Depends(get_db),
+    student: dict = Depends(get_current_student),
+):
+    if payload.student_id != student["student_id"]:
+        raise HTTPException(status_code=403, detail="Cannot submit an attempt for another student.")
+
+    question = (
+        await db.execute(select(Question).where(Question.id == payload.question_id))
+    ).scalar_one_or_none()
+    if question is None:
+        raise HTTPException(status_code=404, detail="Question not found.")
+
+    answer_rows = (
+        (await db.execute(select(AnswerKey).where(AnswerKey.question_id == payload.question_id)))
+        .scalars()
+        .all()
+    )
+    correct_row = next((a for a in answer_rows if a.is_correct), None)
+    is_correct = correct_row is not None and _matches(question.question_type, payload.submitted_answer, correct_row)
+    correct_answer = (
+        (correct_row.option_label if question.question_type == "multiple_choice" and correct_row.option_label else correct_row.option_text)
+        if correct_row is not None
+        else ""
+    )
+
+    prior_attempts = (
+        await db.execute(
+            select(func.count())
+            .select_from(Attempt)
+            .where(Attempt.student_id == payload.student_id, Attempt.question_id == payload.question_id)
+        )
+    ).scalar_one()
+
+    db.add(
+        Attempt(
+            student_id=payload.student_id,
+            question_id=payload.question_id,
+            submitted_answer=payload.submitted_answer,
+            is_correct=is_correct,
+            attempt_number=prior_attempts + 1,
+        )
+    )
+
+    now = datetime.now(timezone.utc)
+    review_row = (
+        await db.execute(
+            select(ReviewQueue).where(
+                ReviewQueue.student_id == payload.student_id, ReviewQueue.question_id == payload.question_id
+            )
+        )
+    ).scalar_one_or_none()
+
+    added_to_review_queue = False
+    if is_correct:
+        if review_row is not None and not review_row.resolved:
+            review_row.consecutive_correct += 1
+            review_row.last_seen_at = now
+            if review_row.consecutive_correct >= 2:
+                review_row.resolved = True
+    else:
+        added_to_review_queue = True
+        if review_row is not None:
+            review_row.consecutive_correct = 0
+            review_row.resolved = False
+            review_row.last_seen_at = now
+        else:
+            db.add(
+                ReviewQueue(
+                    student_id=payload.student_id,
+                    question_id=payload.question_id,
+                    consecutive_correct=0,
+                    resolved=False,
+                    last_seen_at=now,
+                )
+            )
+
+    await db.commit()
+
+    return AttemptResult(
+        is_correct=is_correct,
+        correct_answer=correct_answer,
+        explanation=None,
+        added_to_review_queue=added_to_review_queue,
+    )

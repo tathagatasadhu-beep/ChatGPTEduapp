@@ -1,69 +1,132 @@
 """
-EduQuestAI ingestion pipeline — STUB.
+EduQuestAI ingestion pipeline — real implementation.
 
-Intended flow (per spec Phase 2):
-  1. OCR the uploaded worksheet PDF with a math-aware OCR engine (Mathpix API
-     or a self-hosted Nougat model) so fractions/inequalities/exponents come
-     out as clean text/LaTeX instead of garbled Unicode.
-  2. Feed the OCR dump to an LLM (OpenAI) with a structured-output prompt that
-     splits it into discrete questions, matches each to its answer key, and
-     tags Subject / Topic / difficulty.
-  3. Write rows into `questions` and `answer_keys`, update `pdfs.status`.
+Flow:
+  1. OCR the uploaded worksheet PDF via Mathpix's async PDF API (submit ->
+     poll -> fetch markdown), which returns math-aware text/LaTeX instead of
+     garbled OCR of fractions/exponents.
+  2. Feed the OCR markdown to an LLM (OpenAI) with a structured-output prompt
+     that splits it into discrete questions, matches each to its answer key,
+     and tags a topic name + difficulty.
+  3. The caller (pdfs.py's background task) writes the returned questions
+     into `questions`/`answer_keys` and updates `pdfs.status`.
 
-This file intentionally does NOT call any real API — wire in your Mathpix/
-Nougat and OpenAI credentials and replace the two TODO functions below.
+Requires MATHPIX_APP_ID/MATHPIX_APP_KEY and OPENAI_API_KEY to be set — see
+.env.example. This module makes real network calls; there's no offline mode.
 """
 import json
+import os
+import time
 from dataclasses import dataclass
+
+import httpx
+from openai import OpenAI
+
+MATHPIX_APP_ID = os.environ.get("MATHPIX_APP_ID", "")
+MATHPIX_APP_KEY = os.environ.get("MATHPIX_APP_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+EXTRACTION_MODEL = os.environ.get("OPENAI_EXTRACTION_MODEL", "gpt-4o")
+
+MATHPIX_POLL_INTERVAL_SECONDS = 3
+MATHPIX_POLL_TIMEOUT_SECONDS = 180
 
 
 @dataclass
 class ExtractedQuestion:
     prompt_text: str
     prompt_latex: str | None
-    options: list[dict]          # [{"label": "A", "text": "...", "is_correct": bool}]
+    options: list[dict]  # [{"label": "A" | None, "text": "...", "is_correct": bool}]
     topic_guess: str
-    difficulty_guess: str         # "easy" | "medium" | "hard"
+    difficulty_guess: str  # "easy" | "medium" | "hard"
 
 
-def ocr_pdf(pdf_path: str) -> str:
-    """
-    TODO: call Mathpix (https://docs.mathpix.com) or a hosted Nougat instance.
-    Return the raw OCR text/LaTeX dump for the whole document.
-    """
-    raise NotImplementedError("Wire up Mathpix or Nougat here.")
+def ocr_pdf(pdf_bytes: bytes, filename: str) -> str:
+    """Submit the PDF to Mathpix's async PDF API, poll until done, return the markdown."""
+    if not MATHPIX_APP_ID or not MATHPIX_APP_KEY:
+        raise RuntimeError("MATHPIX_APP_ID / MATHPIX_APP_KEY are not configured.")
+
+    auth_headers = {"app_id": MATHPIX_APP_ID, "app_key": MATHPIX_APP_KEY}
+
+    with httpx.Client(timeout=60) as client:
+        submit = client.post(
+            "https://api.mathpix.com/v3/pdf",
+            headers=auth_headers,
+            files={"file": (filename, pdf_bytes, "application/pdf")},
+            data={"options_json": json.dumps({"conversion_formats": {"md": True}})},
+        )
+        submit.raise_for_status()
+        mathpix_pdf_id = submit.json()["pdf_id"]
+
+        deadline = time.monotonic() + MATHPIX_POLL_TIMEOUT_SECONDS
+        status = None
+        while time.monotonic() < deadline:
+            status_resp = client.get(f"https://api.mathpix.com/v3/pdf/{mathpix_pdf_id}", headers=auth_headers)
+            status_resp.raise_for_status()
+            status = status_resp.json().get("status")
+            if status == "completed":
+                break
+            if status == "error":
+                raise RuntimeError(f"Mathpix OCR failed: {status_resp.json()}")
+            time.sleep(MATHPIX_POLL_INTERVAL_SECONDS)
+        else:
+            raise TimeoutError(f"Mathpix OCR did not complete in time (last status: {status}).")
+
+        md_resp = client.get(f"https://api.mathpix.com/v3/pdf/{mathpix_pdf_id}.md", headers=auth_headers)
+        md_resp.raise_for_status()
+        return md_resp.text
 
 
-EXTRACTION_SYSTEM_PROMPT = """You are an exam-parsing engine. Given raw OCR'd text
-from a math/science worksheet, split it into individual questions. For each
-question return: prompt_text, prompt_latex (if it contains math), multiple
-choice options with the correct one flagged, a best-guess topic name, and a
-difficulty estimate (easy/medium/hard). Respond ONLY with a JSON array, no
-prose, no markdown fences."""
+EXTRACTION_SYSTEM_PROMPT = """You are an exam-parsing engine. Given raw OCR'd markdown from a
+math/science worksheet, split it into individual questions.
+
+Respond with a JSON object of exactly this shape, no prose, no markdown fences:
+{
+  "questions": [
+    {
+      "prompt_text": "plain-text version of the question",
+      "prompt_latex": "LaTeX version if it contains math, else null",
+      "options": [
+        {"label": "A", "text": "option text", "is_correct": true},
+        {"label": "B", "text": "option text", "is_correct": false}
+      ],
+      "topic_guess": "short topic name, e.g. 'Related Rates'",
+      "difficulty_guess": "easy" | "medium" | "hard"
+    }
+  ]
+}
+
+For free-response questions (no multiple-choice options), return a single option
+with "label": null and "text" set to the accepted answer."""
+
+
+def _parse_question(item: dict) -> ExtractedQuestion:
+    return ExtractedQuestion(
+        prompt_text=item["prompt_text"],
+        prompt_latex=item.get("prompt_latex"),
+        options=item.get("options", []),
+        topic_guess=item.get("topic_guess") or "General",
+        difficulty_guess=item.get("difficulty_guess") or "medium",
+    )
 
 
 def extract_questions(ocr_text: str) -> list[ExtractedQuestion]:
-    """
-    TODO: call the OpenAI API (see anthropic_api_in_artifacts-style pattern,
-    or the OpenAI SDK directly) with EXTRACTION_SYSTEM_PROMPT + ocr_text,
-    parse the JSON response, and map it into ExtractedQuestion objects.
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
 
-    Example shape once wired up:
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": ocr_text},
-            ],
-        )
-        raw = json.loads(response.choices[0].message.content)
-        return [ExtractedQuestion(**item) for item in raw]
-    """
-    raise NotImplementedError("Wire up the OpenAI extraction call here.")
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
+        model=EXTRACTION_MODEL,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": ocr_text},
+        ],
+    )
+    raw = json.loads(response.choices[0].message.content)
+    return [_parse_question(item) for item in raw["questions"]]
 
 
-def run_pipeline(pdf_path: str) -> list[ExtractedQuestion]:
+def run_pipeline(pdf_bytes: bytes, filename: str) -> list[ExtractedQuestion]:
     """Entry point called by the background job triggered from pdfs.upload_pdf."""
-    ocr_text = ocr_pdf(pdf_path)
+    ocr_text = ocr_pdf(pdf_bytes, filename)
     return extract_questions(ocr_text)

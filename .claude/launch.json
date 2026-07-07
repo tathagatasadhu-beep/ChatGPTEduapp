@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend",
+      "runtimeExecutable": "C:\\Users\\sayan\\OneDrive\\Desktop\\Project\\eduquest-ai\\backend\\venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "C:\\Users\\sayan\\OneDrive\\Desktop\\Project\\eduquest-ai\\backend\\dev_server_sqlite.py"
+      ],
+      "port": 8000
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "C:\\Users\\sayan\\OneDrive\\Desktop\\Project\\eduquest-ai\\frontend\\dev.cmd",
+      "runtimeArgs": [],
+      "port": 3000
+    }
+  ]
+}

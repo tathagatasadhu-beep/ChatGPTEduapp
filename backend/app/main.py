@@ -8,6 +8,10 @@ This wires up the router modules. Each router is a stub — see the TODOs inside
 for where to plug in real Supabase auth, Postgres queries (via SQLAlchemy or
 asyncpg), and the AI ingestion pipeline.
 """
+from dotenv import load_dotenv
+
+load_dotenv()  # local dev only — Render sets real env vars directly in production
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 

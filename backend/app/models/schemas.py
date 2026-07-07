@@ -15,6 +15,27 @@ class ParentSignup(BaseModel):
     password: str
 
 
+class ParentLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class ParentOut(BaseModel):
+    id: UUID
+    email: EmailStr
+    full_name: str
+
+
+class AuthToken(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: ParentOut
+
+
+class StudentLoginRequest(BaseModel):
+    code: str
+
+
 class StudentCreate(BaseModel):
     display_name: str
     grade_level: Optional[str] = None
@@ -26,6 +47,22 @@ class StudentOut(BaseModel):
     grade_level: Optional[str]
     xp_total: int
     streak_days: int
+
+
+class StudentCreateOut(StudentOut):
+    login_code: str  # plaintext code, only ever returned here — give it to the child
+
+
+class StudentAuthToken(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    student: StudentOut
+
+
+class SubjectOut(BaseModel):
+    id: UUID
+    name: str
+    description: Optional[str] = None
 
 
 class Topic(BaseModel):
@@ -40,7 +77,7 @@ class QuestionOut(BaseModel):
     prompt_text: str
     prompt_latex: Optional[str] = None
     image_path: Optional[str] = None
-    difficulty: Literal["easy", "medium", "hard"]
+    difficulty: Optional[Literal["easy", "medium", "hard"]] = None
     question_type: Literal["multiple_choice", "free_response"]
     options: list[dict] = []  # [{option_label, option_text}] — is_correct withheld client-side
 
